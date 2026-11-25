@@ -114,6 +114,12 @@
       $('seekBar').style.setProperty('--played', pct + '%');
     }
     const info = engine.getMixInfo();
+    const deckInfo = $('deckInfo');
+    if (deckInfo) {
+      const a = engine.track && engine.analysis.get(engine.track.id);
+      const b = info && info.next && engine.analysis.get(info.next.id);
+      deckInfo.textContent = a ? `A ${Math.round(a.bpm)} BPM · B ${b ? Math.round(b.bpm) : '…'} BPM · ${info ? info.strategy : 'анализ'}` : 'анализ структуры…';
+    }
     const marker = $('mixMarker');
     if (info && d) {
       marker.hidden = false;

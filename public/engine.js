@@ -3,6 +3,9 @@
   'use strict';
   const API = window.RH_DJ_API || 'https://rh-ai-dj-lab-api.rh-launcher.workers.dev';
   const CAMELOT = ['8B','3B','10B','5B','12B','7B','2B','9B','4B','11B','6B','1B'];
+  const ANALYSIS_CACHE = 'rh_dj_analysis_v2';
+  const readCache = () => { try { return JSON.parse(localStorage.getItem(ANALYSIS_CACHE) || '{}') || {}; } catch { return {}; } };
+  const writeCache = (cache) => { try { localStorage.setItem(ANALYSIS_CACHE, JSON.stringify(cache)); } catch { /* quota */ } };
 
   function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
   function rms(data) { let s = 0; for (let i = 0; i < data.length; i += 1) s += data[i] * data[i]; return Math.sqrt(s / Math.max(1, data.length)); }
@@ -166,6 +169,13 @@
     return best || { exitAt: Math.max(a.duration*0.6,a.duration-20), entryAt: b.introEnd || 0, durationSec: 12, bars: 4, strategy:'fallback', score:base, next:b };
   }
 
+  function nextInOrder(library, current) {
+    if (!library.length) return null;
+    const index = library.findIndex((t) => t.id === current.id);
+    if (index < 0) return library[0];
+    return library[(index + 1) % library.length];
+  }
+
   class Deck {
     constructor(ctx, master) {
       this.audio = new Audio();
@@ -247,6 +257,11 @@
     }
     async analyze(track) {
       if (this.analysis.has(track.id)) return this.analysis.get(track.id);
+      const cache = readCache();
+      if (cache[track.id] && cache[track.id].bpm) {
+        this.analysis.set(track.id, cache[track.id]);
+        return cache[track.id];
+      }
       const res = await fetch(API + '/api/stream/' + track.source + '/' + encodeURIComponent(track.sourceId));
       if (!res.ok) throw new Error('stream_unavailable');
       const buf = await res.arrayBuffer();
@@ -254,6 +269,11 @@
       const analysis = analyzeBuffer(decoded);
       analysis.trackId = track.id;
       this.analysis.set(track.id, analysis);
+      const nextCache = readCache();
+      nextCache[track.id] = analysis;
+      const ids = Object.keys(nextCache);
+      if (ids.length > 80) for (const id of ids.slice(0, ids.length - 80)) delete nextCache[id];
+      writeCache(nextCache);
       this.onStatus({ phase: 'analyzed', track });
       return analysis;
     }
@@ -279,10 +299,9 @@
       this.startMonitor();
     }
     async primeCandidates(currentTrack) {
-      const candidates = this.library.filter((t) => t.id !== currentTrack.id).slice(0, 4);
-      for (const track of candidates) {
-        if (this.analysis.has(track.id)) continue;
-        try { await this.analyze(track); } catch { /* skip */ }
+      const next = nextInOrder(this.library, currentTrack);
+      if (next && !this.analysis.has(next.id)) {
+        try { await this.analyze(next); } catch { /* skip */ }
       }
     }
     async prepareNext() {
@@ -290,23 +309,16 @@
       const currentAnalysis = this.analysis.get(this.track.id);
       if (!currentAnalysis) return null;
       if (this.prepared && this.prepared.forId === this.track.id) return this.prepared;
-      const candidates = this.library.filter((t) => t.id !== this.track.id).slice(0, 8);
-      let best = null; let bestScore = -999; let bestPlan = null;
-      for (const candidate of candidates) {
-        const ca = this.analysis.get(candidate.id);
-        if (!ca) continue;
-        const plan = planTransition(currentAnalysis, ca);
-        const score = plan ? plan.score : scoreCandidate(currentAnalysis, ca);
-        if (score > bestScore) { bestScore = score; best = { track: candidate, analysis: ca }; bestPlan = plan; }
-      }
-      if (!best && candidates[0]) {
-        try {
-          const ca = await this.analyze(candidates[0]);
-          best = { track: candidates[0], analysis: ca };
-          bestPlan = planTransition(currentAnalysis, ca);
-        } catch { return null; }
-      }
-      if (!best) return null;
+      // Порядок задаёт пользователь. Движок не ранжирует и не переставляет треки.
+      const candidate = nextInOrder(this.library, this.track);
+      if (!candidate) return null;
+      let best = null; let bestPlan = null;
+      try {
+        const ca = await this.analyze(candidate);
+        best = { track: candidate, analysis: ca };
+        bestPlan = planTransition(currentAnalysis, ca);
+      } catch { return null; }
+      const bestScore = bestPlan ? bestPlan.score : scoreCandidate(currentAnalysis, best.analysis);
       const deckIndex = 1 - this.current;
       const deck = this.decks[deckIndex];
       try {
@@ -339,15 +351,11 @@
       const analysis = this.analysis.get(this.track.id);
       if (!analysis) return null;
       const beat = 60 / Math.max(60, analysis.bpm || 120);
-      const candidates = this.library.filter((t) => t.id !== this.track.id);
-      let next = candidates[0] || null;
+      const next = nextInOrder(this.library, this.track);
       let bestPlan = null;
-      for (const candidate of candidates.slice(0, 8)) {
-        const ca = this.analysis.get(candidate.id);
-        if (!ca) continue;
-        const plan = planTransition(analysis, ca);
-        if (!plan) continue;
-        if (!bestPlan || plan.score > bestPlan.score) { bestPlan = plan; next = candidate; }
+      if (next) {
+        const ca = this.analysis.get(next.id);
+        if (ca) bestPlan = planTransition(analysis, ca);
       }
       if (!bestPlan) {
         const fallbackAt = Math.max(analysis.duration * 0.65, analysis.duration - 20);
@@ -372,7 +380,8 @@
         const currentAnalysis = this.analysis.get(currentTrack.id);
         if (!currentAnalysis) { this.transitioning = false; return; }
         let prepared = this.prepared;
-        if (!prepared || prepared.forId !== currentTrack.id) prepared = await this.prepareNext();
+        const expected = nextInOrder(this.library, currentTrack);
+        if (!prepared || prepared.forId !== currentTrack.id || !expected || prepared.track.id !== expected.id) prepared = await this.prepareNext();
         if (!prepared || prepared.deckIndex !== 1 - this.current) { this.transitioning = false; return; }
         const nextTrack = prepared.track, nextAnalysis = prepared.analysis;
         const nextDeck = this.decks[prepared.deckIndex], oldDeck = this.decks[this.current];
