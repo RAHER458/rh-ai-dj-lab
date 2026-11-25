@@ -195,9 +195,42 @@
       if (!deck || !track) return;
       let analysis = this.analysis.get(track.id);
       if (!analysis) { try { analysis = await this.analyze(track); } catch { return; } }
+      const info = this.getMixInfo();
       const remaining = (deck.audio.duration || analysis.duration || 0) - deck.audio.currentTime;
-      if (remaining <= 0 || remaining > 42) return;
+      if (!info || remaining <= 0) return;
+      if (remaining > Math.max(2, (analysis.duration || 0) - info.at + 2)) return;
       await this.transition();
+    }
+    getMixInfo() {
+      if (!this.track) return null;
+      const analysis = this.analysis.get(this.track.id);
+      if (!analysis) return null;
+      const bpm = Math.max(60, Number(analysis.bpm) || 120);
+      const beat = 60 / bpm;
+      const phrase = beat * 32;
+      const lead = Math.min(48, Math.max(24, phrase));
+      let at = Math.max(analysis.introEnd || 8, (analysis.duration || 0) - lead);
+      // Привязываем точку к четырёхтактовой сетке, чтобы метка совпадала с музыкой.
+      at = Math.max(0, Math.floor(at / (beat * 4)) * beat * 4);
+      const candidates = this.library.filter((t) => t.id !== this.track.id);
+      let next = candidates[0] || null;
+      let bestScore = -999;
+      for (const candidate of candidates.slice(0, 6)) {
+        const ca = this.analysis.get(candidate.id);
+        if (!ca) continue;
+        const score = scoreCandidate(analysis, ca);
+        if (score > bestScore) { bestScore = score; next = candidate; }
+      }
+      return { at, next, lead, phrase, score: bestScore };
+    }
+    seek(seconds) {
+      if (!this.decks) return false;
+      const deck = this.decks[this.current];
+      const duration = deck.audio.duration || (this.track && this.track.duration) || 0;
+      if (!duration) return false;
+      deck.audio.currentTime = clamp(Number(seconds) || 0, 0, Math.max(0, duration - 0.15));
+      this.onStatus({ phase: this.playing ? 'playing' : 'paused', track: this.track });
+      return true;
     }
     async transition() {
       if (this.transitioning) return;

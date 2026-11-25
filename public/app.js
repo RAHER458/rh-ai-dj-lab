@@ -6,6 +6,7 @@
   let library = [];
   try { library = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch { library = []; }
   let current = null;
+  let seekDirty = false;
   let searchAbort = null;
 
   const engine = new window.RH_DJ.Engine({
@@ -101,12 +102,44 @@
     if (next) { try { await engine.playTrack(next); renderCurrent(next); } catch { /* ignore */ } }
   });
   $('mixBtn').addEventListener('click', () => engine.toggle());
-  setInterval(() => {
+  function fmt(s) { const n = Math.max(0, Math.round(Number(s) || 0)); return Math.floor(n / 60) + ':' + String(n % 60).padStart(2, '0'); }
+  function updateTimeline() {
     if (!engine.decks) return;
     const d = engine.duration(); const p = engine.position();
-    $('progress').style.width = d ? Math.min(100, p / d * 100) + '%' : '0%';
+    const pct = d ? Math.min(100, p / d * 100) : 0;
+    $('currentTime').textContent = fmt(p);
+    $('durationTime').textContent = fmt(d);
+    if (!seekDirty) {
+      $('seekBar').value = String(Math.round(pct * 10));
+      $('seekBar').style.setProperty('--played', pct + '%');
+    }
+    const info = engine.getMixInfo();
+    const marker = $('mixMarker');
+    if (info && d) {
+      marker.hidden = false;
+      marker.style.left = Math.min(100, info.at / d * 100) + '%';
+      marker.title = 'Переход: ' + fmt(info.at) + (info.next ? ' → ' + info.next.title : '');
+      $('mixPointLabel').textContent = 'MIX ' + fmt(info.at) + (info.next ? ' → ' + info.next.title : '');
+    } else {
+      marker.hidden = true;
+      $('mixPointLabel').textContent = '';
+    }
     const btn = $('playBtn'); if (btn) btn.textContent = engine.playing ? '❚❚' : '▶';
-  }, 500);
+  }
+  $('seekBar').addEventListener('input', () => {
+    seekDirty = true;
+    const d = engine.duration();
+    const value = Number($('seekBar').value) / 1000;
+    $('seekBar').style.setProperty('--played', (value * 100) + '%');
+    $('currentTime').textContent = fmt(d * value);
+  });
+  $('seekBar').addEventListener('change', () => {
+    const d = engine.duration();
+    engine.seek(d * Number($('seekBar').value) / 1000);
+    seekDirty = false;
+    updateTimeline();
+  });
+  setInterval(updateTimeline, 500);
   renderLibrary();
   window.__djDebug = { engine, getLibrary: () => library, getCurrent: () => current };
 })();
