@@ -106,7 +106,8 @@
       this.low = ctx.createBiquadFilter(); this.low.type = 'lowshelf'; this.low.frequency.value = 180;
       this.mid = ctx.createBiquadFilter(); this.mid.type = 'peaking'; this.mid.frequency.value = 1100; this.mid.Q.value = 0.7;
       this.high = ctx.createBiquadFilter(); this.high.type = 'highshelf'; this.high.frequency.value = 6500;
-      this.source.connect(this.low).connect(this.mid).connect(this.high).connect(this.gain).connect(master);
+      this.filter = ctx.createBiquadFilter(); this.filter.type = 'allpass'; this.filter.frequency.value = 20000; this.filter.Q.value = 0.7;
+      this.source.connect(this.low).connect(this.mid).connect(this.high).connect(this.filter).connect(this.gain).connect(master);
       this.gain.gain.value = 0;
     }
     load(url) {
@@ -142,6 +143,13 @@
       ramp(this.low.gain, lowDb);
       ramp(this.mid.gain, midDb);
       ramp(this.high.gain, highDb);
+    }
+    setFilter(type, frequency, time = 0.2) {
+      const now = this.gain.context.currentTime;
+      this.filter.type = type;
+      this.filter.frequency.cancelScheduledValues(now);
+      this.filter.frequency.setValueAtTime(this.filter.frequency.value, now);
+      this.filter.frequency.linearRampToValueAtTime(frequency, now + Math.max(0.01, time));
     }
     setRate(value) {
       this.audio.preservesPitch = true;
@@ -318,12 +326,19 @@
         entry = Math.max(0, Math.floor(entry / beat) * beat);
         if (entry >= (best.analysis.duration || 0) - 4) entry = 0;
 
-        const bars = strategy === 'safe filter blend' ? 4 : strategy === 'short EQ blend' ? 4 : 8;
+        const bars = strategy === 'beat + EQ blend' ? 8 : 4;
         const duration = Math.min(24, Math.max(6, bars * 4 * beat));
         const start = this.ctx.currentTime + 0.06;
 
         nextDeck.setGain(0, 0.01);
         nextDeck.setEq(-24, -18, -14, 0.01);
+        if (strategy === 'safe filter blend') {
+          nextDeck.setFilter('highpass', 320, 0.01);
+          oldDeck.setFilter('lowpass', 18000, 0.01);
+        } else {
+          nextDeck.setFilter('allpass', 20000, 0.01);
+          oldDeck.setFilter('allpass', 20000, 0.01);
+        }
         await nextDeck.play(entry);
 
         const gainOut = oldDeck.gain.gain;
@@ -351,6 +366,16 @@
         oldDeck.low.gain.linearRampToValueAtTime(-24, swapStart + swapLen);
         oldDeck.mid.gain.setValueAtTime(0, swapStart);
         oldDeck.mid.gain.linearRampToValueAtTime(-8, swapStart + swapLen);
+        if (strategy === 'safe filter blend') {
+          nextDeck.filter.frequency.linearRampToValueAtTime(35, start + duration * 0.85);
+          oldDeck.filter.frequency.linearRampToValueAtTime(1400, start + duration * 0.85);
+        }
+        if (strategy === 'vocal-safe blend') {
+          nextDeck.mid.gain.setValueAtTime(-18, start);
+          nextDeck.mid.gain.linearRampToValueAtTime(-8, swapStart);
+          oldDeck.mid.gain.setValueAtTime(0, start);
+          oldDeck.mid.gain.linearRampToValueAtTime(-12, start + duration * 0.6);
+        }
 
         this.current = 1 - this.current;
         this.prepared = null;
