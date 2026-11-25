@@ -62,6 +62,27 @@
     const duration = buffer.duration;
     const introEnd = Math.min(duration * 0.18, 24);
     const outroStart = Math.max(duration - Math.min(duration * 0.18, 32), duration * 0.65);
+    const beatSec = 60 / Math.max(60, bpm || 120);
+    const sections = [];
+    const block = Math.max(8, beatSec * 32);
+    const frameRate = sr / hop;
+    const blockEnergies = [];
+    for (let start = 0; start < duration; start += block) {
+      const end = Math.min(duration, start + block);
+      const from = Math.max(0, Math.floor(start * frameRate));
+      const to = Math.min(energies.length, Math.ceil(end * frameRate));
+      let sum = 0;
+      for (let i = from; i < to; i += 1) sum += energies[i] || 0;
+      const avg = to > from ? sum / (to - from) : 0;
+      blockEnergies.push(avg);
+      const kind = start < duration * 0.12 ? 'intro'
+        : end > duration * 0.88 ? 'outro'
+          : avg < 0.025 ? 'breakdown'
+            : avg > 0.07 ? 'drop' : 'verse';
+      sections.push({ start, end, energy: avg, kind });
+    }
+    const maxBlock = Math.max(0.0001, ...blockEnergies);
+    for (const section of sections) section.energy = clamp(section.energy / maxBlock, 0.15, 1);
     return {
       bpm: Math.round(bpm * 10) / 10,
       bpmConfidence: clamp(best.score * 18, 0, 1),
@@ -75,6 +96,7 @@
       beat: 60 / Math.max(60, bpm || 120),
       phrase: 32 * (60 / Math.max(60, bpm || 120)),
       beatOffset,
+      sections,
       low, mid, high,
     };
   }
@@ -94,6 +116,61 @@
     const energyDelta = Math.abs((next.energy || 0) - (current.energy || 0));
     const vocal = Math.min(current.vocalRisk || 0, next.vocalRisk || 0);
     return 5 - bpmDelta * 30 - harmonic * 0.9 - energyDelta * 2 - vocal;
+  }
+
+  function planTransition(a, b) {
+    if (!a || !b) return null;
+    const beat = 60 / Math.max(60, a.bpm || 120);
+    const phrase = beat * 32;
+    const base = scoreCandidate(a, b);
+    const exits = [];
+    for (const section of a.sections || []) {
+      if (section.start > a.duration * 0.45 && section.start < a.duration - 6) exits.push(section.start);
+      if (section.end > a.duration * 0.5 && section.end < a.duration - 5) exits.push(section.end);
+    }
+    for (let t = a.duration * 0.5; t < a.duration - 6; t += phrase) exits.push(t);
+    if (!exits.length) exits.push(Math.max(a.duration * 0.6, a.duration - 24));
+    const entries = [];
+    for (const section of b.sections || []) {
+      if (section.start < b.duration - 6 && (section.kind === 'drop' || section.kind === 'verse')) entries.push(section.start);
+    }
+    if (b.introEnd) entries.push(b.introEnd);
+    if (!entries.length) {
+      for (const section of b.sections || []) {
+        if (section.start < b.duration - 6 && section.start > 0) entries.push(section.start);
+      }
+    }
+    if (!entries.length) entries.push(0);
+    let best = null;
+    for (const exitRaw of exits) {
+      const exitAt = Math.max(0, Math.floor(exitRaw / (beat * 4)) * beat * 4);
+      if (exitAt >= a.duration - 4) continue;
+      for (const entryRaw of entries) {
+        const entryAt = Math.max(0, Math.floor(entryRaw / (beat * 4)) * beat * 4);
+        if (entryAt >= b.duration - 5) continue;
+        let bars = 8;
+        if (a.duration - exitAt > phrase * 3) bars = 16;
+        let durationSec = bars * 4 * beat;
+        if (exitAt + durationSec > a.duration - 1) { bars = 4; durationSec = bars * 4 * beat; }
+        if (exitAt + durationSec > a.duration - 0.5) continue;
+        const section = (a.sections || []).find((item) => exitAt >= item.start - 1 && exitAt <= item.end + 1);
+        const sectionEnergy = section ? section.energy : 0.5;
+        const entrySection = (b.sections || []).find((item) => entryAt >= item.start - 1 && entryAt <= item.end + 1);
+        const entryEnergy = entrySection ? entrySection.energy : 0.5;
+        const nearEndPenalty = Math.max(0, exitAt - (a.duration - 35)) / 8;
+        const pairScore = base + sectionEnergy * 2 + entryEnergy * 1.2 - Math.abs(sectionEnergy - entryEnergy) * 1.5 - nearEndPenalty;
+        const bpmDiff = Math.abs((b.bpm || 0) - (a.bpm || 0)) / Math.max(1, a.bpm || 1);
+        const harmonic = keyDistance(a.key, b.key);
+        const vocal = Math.min(a.vocalRisk || 0, b.vocalRisk || 0);
+        const strategy = bpmDiff > 0.1 ? 'filter fallback'
+          : vocal > 0.55 ? 'vocal-aware phrase blend'
+            : harmonic <= 1 ? 'beat + EQ phrase blend' : 'phrase blend';
+        if (!best || pairScore > best.score) {
+          best = { exitAt, entryAt, durationSec, bars, strategy, score: pairScore, next: b };
+        }
+      }
+    }
+    return best || { exitAt: Math.max(a.duration * 0.65, a.duration - 20), entryAt: b.introEnd || 0, durationSec: phrase, bars: 8, strategy: 'safe fallback', score: base, next: b };
   }
 
   class Deck {
@@ -221,15 +298,20 @@
       if (!currentAnalysis) return null;
       if (this.prepared && this.prepared.forId === this.track.id) return this.prepared;
       const candidates = this.library.filter((t) => t.id !== this.track.id).slice(0, 8);
-      let best = null; let bestScore = -999;
+      let best = null; let bestScore = -999; let bestPlan = null;
       for (const candidate of candidates) {
         const ca = this.analysis.get(candidate.id);
         if (!ca) continue;
-        const score = scoreCandidate(currentAnalysis, ca);
-        if (score > bestScore) { bestScore = score; best = { track: candidate, analysis: ca }; }
+        const plan = planTransition(currentAnalysis, ca);
+        const score = plan ? plan.score : scoreCandidate(currentAnalysis, ca);
+        if (score > bestScore) { bestScore = score; best = { track: candidate, analysis: ca }; bestPlan = plan; }
       }
       if (!best && candidates[0]) {
-        try { best = { track: candidates[0], analysis: await this.analyze(candidates[0]) }; } catch { return null; }
+        try {
+          const ca = await this.analyze(candidates[0]);
+          best = { track: candidates[0], analysis: ca };
+          bestPlan = planTransition(currentAnalysis, ca);
+        } catch { return null; }
       }
       if (!best) return null;
       const deckIndex = 1 - this.current;
@@ -237,7 +319,7 @@
       try {
         await deck.load(API + '/api/stream/' + best.track.source + '/' + encodeURIComponent(best.track.sourceId));
       } catch { return null; }
-      this.prepared = { ...best, deckIndex, forId: this.track.id, score: bestScore };
+      this.prepared = { ...best, plan: bestPlan, deckIndex, forId: this.track.id, score: bestScore };
       this.onStatus({ phase: this.mix ? 'prepared' : 'ready_next', next: best.track });
       return this.prepared;
     }
@@ -253,35 +335,32 @@
       let analysis = this.analysis.get(track.id);
       if (!analysis) { try { analysis = await this.analyze(track); } catch { return; } }
       const info = this.getMixInfo();
-      const remaining = (deck.audio.duration || analysis.duration || 0) - deck.audio.currentTime;
-      if (!info || remaining <= 0) return;
-      const threshold = Math.max(2, (analysis.duration || 0) - info.at + 2);
-      if (remaining > 60) return;
-      if (!this.prepared) await this.prepareNext();
-      if (remaining > threshold) return;
+      if (!info) return;
+      const position = deck.audio.currentTime || 0;
+      if (!this.prepared && position >= Math.max(0, info.at - 60)) await this.prepareNext();
+      if (position < info.at) return;
       await this.transition();
     }
     getMixInfo() {
       if (!this.track) return null;
       const analysis = this.analysis.get(this.track.id);
       if (!analysis) return null;
-      const bpm = Math.max(60, Number(analysis.bpm) || 120);
-      const beat = 60 / bpm;
-      const phrase = beat * 32;
-      const lead = Math.min(48, Math.max(24, phrase));
-      let at = Math.max(analysis.introEnd || 8, (analysis.duration || 0) - lead);
-      // Привязываем точку к четырёхтактовой сетке, чтобы метка совпадала с музыкой.
-      at = Math.max(0, Math.floor(at / (beat * 4)) * beat * 4);
+      const beat = 60 / Math.max(60, analysis.bpm || 120);
       const candidates = this.library.filter((t) => t.id !== this.track.id);
       let next = candidates[0] || null;
-      let bestScore = -999;
-      for (const candidate of candidates.slice(0, 6)) {
+      let bestPlan = null;
+      for (const candidate of candidates.slice(0, 8)) {
         const ca = this.analysis.get(candidate.id);
         if (!ca) continue;
-        const score = scoreCandidate(analysis, ca);
-        if (score > bestScore) { bestScore = score; next = candidate; }
+        const plan = planTransition(analysis, ca);
+        if (!plan) continue;
+        if (!bestPlan || plan.score > bestPlan.score) { bestPlan = plan; next = candidate; }
       }
-      return { at, next, lead, phrase, score: bestScore };
+      if (!bestPlan) {
+        const fallbackAt = Math.max(analysis.duration * 0.65, analysis.duration - 20);
+        bestPlan = { exitAt: Math.floor(fallbackAt / (beat * 4)) * beat * 4, entryAt: 0, durationSec: 12, bars: 8, score: 0, strategy: 'safe fallback' };
+      }
+      return { ...bestPlan, at: bestPlan.exitAt, next: next || bestPlan.next, analysis };
     }
     seek(seconds) {
       if (!this.decks) return false;
@@ -307,11 +386,9 @@
         const nextDeck = this.decks[prepared.deckIndex];
         const oldDeck = this.decks[this.current];
 
-        const bpmDiff = Math.abs((best.analysis.bpm || 0) - (currentAnalysis.bpm || 0)) / Math.max(1, currentAnalysis.bpm || 1);
-        const harmonic = keyDistance(currentAnalysis.key, best.analysis.key);
-        const vocal = Math.min(currentAnalysis.vocalRisk || 0, best.analysis.vocalRisk || 0);
-        const strategy = bpmDiff <= 0.06 && harmonic <= 2 ? (vocal > 0.5 ? 'vocal-safe blend' : 'beat + EQ blend') : bpmDiff <= 0.1 ? 'short EQ blend' : 'safe filter blend';
-        this.onStatus({ phase: 'mixing', next: best.track, strategy });
+        const plan = prepared.plan || planTransition(currentAnalysis, best.analysis);
+        const strategy = plan.strategy;
+        this.onStatus({ phase: 'mixing', next: best.track, strategy, plan });
 
         // Дек уже подготовлен в prepareNext(): не загружаем и не анализируем
         // следующий трек в момент перехода.
@@ -322,17 +399,22 @@
         const rate = clamp(targetBpm / sourceBpm, 0.94, 1.06);
         nextDeck.setRate(rate);
         const beat = 60 / targetBpm;
-        let entry = Math.max(0, Number(best.analysis.introEnd) || 0);
-        entry = Math.max(0, Math.floor(entry / beat) * beat);
+        let entry = Math.max(0, Number(plan.entryAt) || 0);
         if (entry >= (best.analysis.duration || 0) - 4) entry = 0;
+        // Фазовая синхронизация: ставим первый beat B на текущую фазу beat A.
+        const mod = (n, m) => ((n % m) + m) % m;
+        const aPhase = mod((oldDeck.audio.currentTime || 0) - (currentAnalysis.beatOffset || 0), beat);
+        const bPhase = mod(entry - (best.analysis.beatOffset || 0), beat);
+        const phaseShift = mod(aPhase - bPhase, beat);
+        if (entry + phaseShift < (best.analysis.duration || 0) - 2) entry += phaseShift;
 
-        const bars = strategy === 'beat + EQ blend' ? 8 : 4;
-        const duration = Math.min(24, Math.max(6, bars * 4 * beat));
+        const bars = plan.bars || 8;
+        const duration = Math.min(32, Math.max(6, plan.durationSec || bars * 4 * beat));
         const start = this.ctx.currentTime + 0.06;
 
         nextDeck.setGain(0, 0.01);
         nextDeck.setEq(-24, -18, -14, 0.01);
-        if (strategy === 'safe filter blend') {
+        if (strategy === 'filter fallback') {
           nextDeck.setFilter('highpass', 320, 0.01);
           oldDeck.setFilter('lowpass', 18000, 0.01);
         } else {
@@ -366,11 +448,11 @@
         oldDeck.low.gain.linearRampToValueAtTime(-24, swapStart + swapLen);
         oldDeck.mid.gain.setValueAtTime(0, swapStart);
         oldDeck.mid.gain.linearRampToValueAtTime(-8, swapStart + swapLen);
-        if (strategy === 'safe filter blend') {
+        if (strategy === 'filter fallback') {
           nextDeck.filter.frequency.linearRampToValueAtTime(35, start + duration * 0.85);
           oldDeck.filter.frequency.linearRampToValueAtTime(1400, start + duration * 0.85);
         }
-        if (strategy === 'vocal-safe blend') {
+        if (strategy.includes('vocal')) {
           nextDeck.mid.gain.setValueAtTime(-18, start);
           nextDeck.mid.gain.linearRampToValueAtTime(-8, swapStart);
           oldDeck.mid.gain.setValueAtTime(0, start);
