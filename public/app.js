@@ -38,7 +38,7 @@
   }
 
   function renderStatus(info) {
-    const map = { loading:'Загрузка', analyzed:'Анализ готов', playing:'Играет', paused:'Пауза', mixing:'Переход', mix_on:'AutoMix включён', mix_off:'Mix выключен' };
+    const map = { loading:'Загрузка', analyzed:'Анализ готов', ready_next:'Следующий готов', prepared:'Следующий готов', playing:'Играет', paused:'Пауза', mixing:'Переход', mix_on:'AutoMix включён', mix_off:'Mix выключен' };
     $('mixState').textContent = map[info.phase] || info.phase;
     $('enginePill').textContent = (info.phase || 'idle').toUpperCase();
     $('mixBtn').classList.toggle('on', engine.mix);

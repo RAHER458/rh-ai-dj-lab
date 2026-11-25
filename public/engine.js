@@ -156,7 +156,7 @@
       this.ctx = null; this.master = null;
       this.decks = null; this.current = 0; this.track = null; this.library = [];
       this.analysis = new Map(); this.playing = false; this.mix = false;
-      this.timer = null; this.transitioning = false; this.onStatus = onStatus; this.onTrack = onTrack;
+      this.timer = null; this.transitioning = false; this.prepared = null; this.onStatus = onStatus; this.onTrack = onTrack;
     }
     async init() {
       if (this.ctx) return;
@@ -195,8 +195,9 @@
       this.playing = true;
       this.onTrack(track);
       this.onStatus({ phase: 'playing', track });
-      this.analyze(track).catch(() => {});
-      this.primeCandidates(track);
+      this.prepared = null;
+      this.analyze(track).then(() => this.prepareNext()).catch(() => {});
+      this.primeCandidates(track).then(() => this.prepareNext()).catch(() => {});
       this.startMonitor();
     }
     async primeCandidates(currentTrack) {
@@ -206,9 +207,35 @@
         try { await this.analyze(track); } catch { /* skip */ }
       }
     }
+    async prepareNext() {
+      if (!this.track || this.transitioning) return null;
+      const currentAnalysis = this.analysis.get(this.track.id);
+      if (!currentAnalysis) return null;
+      if (this.prepared && this.prepared.forId === this.track.id) return this.prepared;
+      const candidates = this.library.filter((t) => t.id !== this.track.id).slice(0, 8);
+      let best = null; let bestScore = -999;
+      for (const candidate of candidates) {
+        const ca = this.analysis.get(candidate.id);
+        if (!ca) continue;
+        const score = scoreCandidate(currentAnalysis, ca);
+        if (score > bestScore) { bestScore = score; best = { track: candidate, analysis: ca }; }
+      }
+      if (!best && candidates[0]) {
+        try { best = { track: candidates[0], analysis: await this.analyze(candidates[0]) }; } catch { return null; }
+      }
+      if (!best) return null;
+      const deckIndex = 1 - this.current;
+      const deck = this.decks[deckIndex];
+      try {
+        await deck.load(API + '/api/stream/' + best.track.source + '/' + encodeURIComponent(best.track.sourceId));
+      } catch { return null; }
+      this.prepared = { ...best, deckIndex, forId: this.track.id, score: bestScore };
+      this.onStatus({ phase: this.mix ? 'prepared' : 'ready_next', next: best.track });
+      return this.prepared;
+    }
     startMonitor() {
       if (this.timer) clearInterval(this.timer);
-      this.timer = setInterval(() => this.tick().catch(() => {}), 1200);
+      this.timer = setInterval(() => this.tick().catch(() => {}), 400);
     }
     async tick() {
       if (!this.mix || !this.playing || this.transitioning) return;
@@ -220,7 +247,10 @@
       const info = this.getMixInfo();
       const remaining = (deck.audio.duration || analysis.duration || 0) - deck.audio.currentTime;
       if (!info || remaining <= 0) return;
-      if (remaining > Math.max(2, (analysis.duration || 0) - info.at + 2)) return;
+      const threshold = Math.max(2, (analysis.duration || 0) - info.at + 2);
+      if (remaining > 60) return;
+      if (!this.prepared) await this.prepareNext();
+      if (remaining > threshold) return;
       await this.transition();
     }
     getMixInfo() {
@@ -261,16 +291,13 @@
         const currentTrack = this.track;
         const currentAnalysis = this.analysis.get(currentTrack.id);
         if (!currentAnalysis) { this.transitioning = false; return; }
-
-        const candidates = this.library.filter((t) => t.id !== currentTrack.id).slice(0, 8);
-        let best = null; let bestScore = -999;
-        for (const candidate of candidates) {
-          let ca = this.analysis.get(candidate.id);
-          if (!ca) { try { ca = await this.analyze(candidate); } catch { continue; } }
-          const score = scoreCandidate(currentAnalysis, ca);
-          if (score > bestScore) { bestScore = score; best = { track: candidate, analysis: ca }; }
-        }
-        if (!best) { this.transitioning = false; return; }
+        let prepared = this.prepared;
+        if (!prepared || prepared.forId !== currentTrack.id) prepared = await this.prepareNext();
+        if (!prepared) { this.transitioning = false; return; }
+        const best = { track: prepared.track, analysis: prepared.analysis };
+        if (prepared.deckIndex !== 1 - this.current) { this.transitioning = false; return; }
+        const nextDeck = this.decks[prepared.deckIndex];
+        const oldDeck = this.decks[this.current];
 
         const bpmDiff = Math.abs((best.analysis.bpm || 0) - (currentAnalysis.bpm || 0)) / Math.max(1, currentAnalysis.bpm || 1);
         const harmonic = keyDistance(currentAnalysis.key, best.analysis.key);
@@ -278,10 +305,8 @@
         const strategy = bpmDiff <= 0.06 && harmonic <= 2 ? (vocal > 0.5 ? 'vocal-safe blend' : 'beat + EQ blend') : bpmDiff <= 0.1 ? 'short EQ blend' : 'safe filter blend';
         this.onStatus({ phase: 'mixing', next: best.track, strategy });
 
-        const nextDeck = this.decks[1 - this.current];
-        const oldDeck = this.decks[this.current];
-        const url = API + '/api/stream/' + best.track.source + '/' + encodeURIComponent(best.track.sourceId);
-        await nextDeck.load(url);
+        // Дек уже подготовлен в prepareNext(): не загружаем и не анализируем
+        // следующий трек в момент перехода.
 
         // Реальный beatmatch: подгоняем темп B под A с сохранением питча.
         const targetBpm = Math.max(60, currentAnalysis.bpm || 120);
@@ -328,6 +353,7 @@
         oldDeck.mid.gain.linearRampToValueAtTime(-8, swapStart + swapLen);
 
         this.current = 1 - this.current;
+        this.prepared = null;
         this.track = best.track;
         this.onTrack(best.track);
         this.onStatus({ phase: 'playing', track: best.track, strategy });
