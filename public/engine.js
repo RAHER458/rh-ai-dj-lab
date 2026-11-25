@@ -322,7 +322,10 @@
       const deckIndex = 1 - this.current;
       const deck = this.decks[deckIndex];
       try {
-        await deck.load(API + '/api/stream/' + best.track.source + '/' + encodeURIComponent(best.track.sourceId));
+        await Promise.race([
+          deck.load(API + '/api/stream/' + best.track.source + '/' + encodeURIComponent(best.track.sourceId)),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('preload_timeout')), 12000)),
+        ]);
       } catch { return null; }
       this.prepared = { ...best, plan: bestPlan, deckIndex, forId: this.track.id, score: bestScore };
       this.onStatus({ phase: this.mix ? 'prepared' : 'ready_next', next: best.track });
@@ -337,13 +340,14 @@
       const deck = this.decks[this.current];
       const track = this.track;
       if (!deck || !track) return;
-      let analysis = this.analysis.get(track.id);
-      if (!analysis) { try { analysis = await this.analyze(track); } catch { return; } }
+      const analysis = this.analysis.get(track.id);
+      if (!analysis) { this.analyze(track).catch(() => {}); return; }
       const info = this.getMixInfo();
       if (!info) return;
       const position = deck.audio.currentTime || 0;
-      if (!this.prepared && position >= Math.max(0, info.at - 60)) await this.prepareNext();
+      if (!this.prepared && position >= Math.max(0, info.at - 60)) this.prepareNext().catch(() => {});
       if (position < info.at) return;
+      if (!this.prepared) return;
       await this.transition();
     }
     getMixInfo() {
@@ -394,7 +398,12 @@
         nextDeck.setRate(rate);
         const beat = 60/bpmA;
         const entry = clamp(Number(plan.entryAt)||0,0,Math.max(0,(nextAnalysis.duration||nextDeck.audio.duration||0)-2));
-        await nextDeck.play(entry);
+        // Never block the transition on an autoplay promise: Safari may resolve it
+        // later, but the EQ/gain schedule must still be committed.
+        await Promise.race([
+          nextDeck.play(entry).catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 700)),
+        ]);
 
         const duration = clamp(plan.durationSec || beat*32, beat*16, beat*64);
         const start = this.ctx.currentTime + 0.12;
