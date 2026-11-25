@@ -384,17 +384,25 @@
         const rate = clamp(bpmA/bpmB,0.94,1.06);
         nextDeck.setRate(rate);
         const beat = 60/bpmA;
-        const entry = clamp(Number(plan.entryAt)||0,0,Math.max(0,nextDeck.audio.duration-2));
+        const entry = clamp(Number(plan.entryAt)||0,0,Math.max(0,(nextAnalysis.duration||nextDeck.audio.duration||0)-2));
         await nextDeck.play(entry);
 
         const duration = clamp(plan.durationSec || beat*32, beat*16, beat*64);
         const start = this.ctx.currentTime + 0.12;
         const end = start + duration;
-        const curve = (param,values,at,sec) => {
+        const applyCurve = (param, values, at, sec) => {
           param.cancelScheduledValues(at);
-          param.setValueAtTime(param.value,at);
-          param.setValueCurveAtTime(Float32Array.from(values),at,sec);
+          try {
+            param.setValueAtTime(param.value, at);
+            param.setValueCurveAtTime(Float32Array.from(values), at, sec);
+          } catch {
+            // Safari edge case: fall back to a safe linear ramp, never abort the mix.
+            param.cancelScheduledValues(at);
+            param.setValueAtTime(values[0], at);
+            param.linearRampToValueAtTime(values[values.length - 1], at + sec);
+          }
         };
+        const curve = applyCurve;
         const N=129, fadeIn=[], fadeOut=[];
         for(let i=0;i<N;i++){
           const x=i/(N-1);
@@ -405,11 +413,7 @@
         curve(nextDeck.gain.gain,fadeIn,start,duration);
         curve(oldDeck.gain.gain,fadeOut,start,duration);
 
-        const ramp=(param,values,at,sec)=>{
-          param.cancelScheduledValues(at);
-          param.setValueAtTime(param.value,at);
-          param.setValueCurveAtTime(Float32Array.from(values),at,sec);
-        };
+        const ramp = applyCurve;
         // Independent frequency-space choreography: new deck opens highs/mids first;
         // low end is deliberately exchanged in the middle of the phrase.
         const lowIn=[], lowOut=[], midIn=[], midOut=[], highIn=[], highOut=[];
@@ -437,9 +441,19 @@
           const duck=[]; for(let i=0;i<N;i++){const x=i/(N-1); duck.push(-10*Math.sin(x*Math.PI/2));}
           ramp(oldDeck.mid.gain,duck,start,duration);
         }
-        // Avoid stale filter settings from a previous transition.
-        nextDeck.setFilter('allpass',20000,0.04);
-        oldDeck.setFilter('allpass',20000,0.04);
+        // Tempo-safe fallback gets a real filter transition; compatible pairs
+        // stay open so the two full-range signals can interact.
+        if (plan.strategy === 'tempo-safe blend') {
+          nextDeck.setFilter('highpass', 260, 0.04);
+          oldDeck.setFilter('lowpass', 18000, 0.04);
+          nextDeck.filter.frequency.setValueAtTime(260, start);
+          nextDeck.filter.frequency.linearRampToValueAtTime(35, end);
+          oldDeck.filter.frequency.setValueAtTime(18000, start);
+          oldDeck.filter.frequency.linearRampToValueAtTime(1200, end);
+        } else {
+          nextDeck.setFilter('allpass', 20000, 0.04);
+          oldDeck.setFilter('allpass', 20000, 0.04);
+        }
 
         this.current=prepared.deckIndex;
         this.prepared=null;
