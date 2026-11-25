@@ -28,6 +28,10 @@
       energies.push(Math.sqrt(e / frame));
     }
     const onset = energies.map((v, i) => Math.max(0, v - (energies[i - 1] || 0)));
+    let beatOffset = 0; let peak = 0;
+    for (let i = 0; i < Math.min(onset.length, 220); i += 1) {
+      if (onset[i] > peak) { peak = onset[i]; beatOffset = i * hop / sr; }
+    }
     // Autocorrelation of the onset envelope for BPM (60–200).
     let best = { bpm: 0, score: 0 };
     const minLag = Math.floor(sr / hop * 60 / 200);
@@ -70,6 +74,7 @@
       outroStart,
       beat: 60 / Math.max(60, bpm || 120),
       phrase: 32 * (60 / Math.max(60, bpm || 120)),
+      beatOffset,
       low, mid, high,
     };
   }
@@ -127,6 +132,23 @@
       this.gain.gain.linearRampToValueAtTime(Math.max(0, value), now + time);
     }
     setBass(value) { this.low.gain.setTargetAtTime(value, this.gain.context.currentTime, 0.03); }
+    setEq(lowDb, midDb, highDb, seconds = 0.2) {
+      const now = this.gain.context.currentTime;
+      const ramp = (param, value) => {
+        param.cancelScheduledValues(now);
+        param.setValueAtTime(param.value, now);
+        param.linearRampToValueAtTime(value, now + Math.max(0.01, seconds));
+      };
+      ramp(this.low.gain, lowDb);
+      ramp(this.mid.gain, midDb);
+      ramp(this.high.gain, highDb);
+    }
+    setRate(value) {
+      this.audio.preservesPitch = true;
+      this.audio.mozPreservesPitch = true;
+      this.audio.webkitPreservesPitch = true;
+      this.audio.playbackRate = clamp(Number(value) || 1, 0.9, 1.1);
+    }
   }
 
   class Engine {
@@ -238,7 +260,9 @@
       try {
         const currentTrack = this.track;
         const currentAnalysis = this.analysis.get(currentTrack.id);
-        const candidates = this.library.filter((t) => t.id !== currentTrack.id).slice(0, 6);
+        if (!currentAnalysis) { this.transitioning = false; return; }
+
+        const candidates = this.library.filter((t) => t.id !== currentTrack.id).slice(0, 8);
         let best = null; let bestScore = -999;
         for (const candidate of candidates) {
           let ca = this.analysis.get(candidate.id);
@@ -246,37 +270,77 @@
           const score = scoreCandidate(currentAnalysis, ca);
           if (score > bestScore) { bestScore = score; best = { track: candidate, analysis: ca }; }
         }
-        if (!best) return;
-        this.onStatus({ phase: 'mixing', next: best.track });
+        if (!best) { this.transitioning = false; return; }
+
+        const bpmDiff = Math.abs((best.analysis.bpm || 0) - (currentAnalysis.bpm || 0)) / Math.max(1, currentAnalysis.bpm || 1);
+        const harmonic = keyDistance(currentAnalysis.key, best.analysis.key);
+        const vocal = Math.min(currentAnalysis.vocalRisk || 0, best.analysis.vocalRisk || 0);
+        const strategy = bpmDiff <= 0.06 && harmonic <= 2 ? (vocal > 0.5 ? 'vocal-safe blend' : 'beat + EQ blend') : bpmDiff <= 0.1 ? 'short EQ blend' : 'safe filter blend';
+        this.onStatus({ phase: 'mixing', next: best.track, strategy });
+
         const nextDeck = this.decks[1 - this.current];
+        const oldDeck = this.decks[this.current];
         const url = API + '/api/stream/' + best.track.source + '/' + encodeURIComponent(best.track.sourceId);
         await nextDeck.load(url);
-        const bars = bestScore > 2 ? 8 : 4;
-        const duration = Math.min(20, Math.max(6, bars * 4 * (60 / Math.max(70, currentAnalysis.bpm || 120))));
-        const now = this.ctx.currentTime;
+
+        // Реальный beatmatch: подгоняем темп B под A с сохранением питча.
+        const targetBpm = Math.max(60, currentAnalysis.bpm || 120);
+        const sourceBpm = Math.max(60, best.analysis.bpm || targetBpm);
+        const rate = clamp(targetBpm / sourceBpm, 0.94, 1.06);
+        nextDeck.setRate(rate);
+        const beat = 60 / targetBpm;
+        let entry = Math.max(0, Number(best.analysis.introEnd) || 0);
+        entry = Math.max(0, Math.floor(entry / beat) * beat);
+        if (entry >= (best.analysis.duration || 0) - 4) entry = 0;
+
+        const bars = strategy === 'safe filter blend' ? 4 : strategy === 'short EQ blend' ? 4 : 8;
+        const duration = Math.min(24, Math.max(6, bars * 4 * beat));
+        const start = this.ctx.currentTime + 0.06;
+
         nextDeck.setGain(0, 0.01);
-        nextDeck.setBass(-6);
-        await nextDeck.play(0);
-        const fade = nextDeck.gain.gain;
-        fade.cancelScheduledValues(now);
-        fade.setValueAtTime(0.0001, now);
-        fade.linearRampToValueAtTime(1, now + duration);
-        const out = this.decks[this.current].gain.gain;
-        out.cancelScheduledValues(now);
-        out.setValueAtTime(Math.max(0.0001, out.value), now);
-        out.linearRampToValueAtTime(0.0001, now + duration);
-        nextDeck.setBass(0);
-        const old = this.decks[this.current];
-        setTimeout(() => { try { old.pause(); old.audio.removeAttribute('src'); old.audio.load(); } catch { /* ignore */ } }, (duration + 0.4) * 1000);
+        nextDeck.setEq(-24, -18, -14, 0.01);
+        await nextDeck.play(entry);
+
+        const gainOut = oldDeck.gain.gain;
+        const gainIn = nextDeck.gain.gain;
+        const ramp = (param, from, to, at, sec) => {
+          param.cancelScheduledValues(at);
+          param.setValueAtTime(from, at);
+          param.linearRampToValueAtTime(to, at + sec);
+        };
+        ramp(gainIn, 0.0001, 1, start, duration);
+        ramp(gainOut, 1, 0.0001, start, duration);
+
+        // Bass swap ближе к середине фразы, а не в случайный момент.
+        const swapStart = start + duration * 0.5;
+        const swapLen = Math.max(0.4, beat * 2);
+        for (const deck of [oldDeck, nextDeck]) deck.setEq(0, 0, 0, 0.01);
+        // Стартовый EQ: у B срезан низ, у A пока полный.
+        nextDeck.low.gain.setValueAtTime(-24, start);
+        nextDeck.mid.gain.setValueAtTime(-18, start);
+        nextDeck.high.gain.setValueAtTime(-14, start);
+        nextDeck.low.gain.linearRampToValueAtTime(0, swapStart + swapLen);
+        nextDeck.mid.gain.linearRampToValueAtTime(0, swapStart + swapLen);
+        nextDeck.high.gain.linearRampToValueAtTime(0, swapStart + swapLen);
+        oldDeck.low.gain.setValueAtTime(0, swapStart);
+        oldDeck.low.gain.linearRampToValueAtTime(-24, swapStart + swapLen);
+        oldDeck.mid.gain.setValueAtTime(0, swapStart);
+        oldDeck.mid.gain.linearRampToValueAtTime(-8, swapStart + swapLen);
+
         this.current = 1 - this.current;
         this.track = best.track;
         this.onTrack(best.track);
-        this.onStatus({ phase: 'playing', track: best.track });
-        setTimeout(() => { this.transitioning = false; }, duration * 1000);
+        this.onStatus({ phase: 'playing', track: best.track, strategy });
+        setTimeout(() => {
+          try { oldDeck.pause(); oldDeck.audio.removeAttribute('src'); oldDeck.audio.load(); } catch { /* ignore */ }
+          this.transitioning = false;
+          this.primeCandidates(best.track);
+        }, (duration + 0.5) * 1000);
       } catch {
         this.transitioning = false;
       }
     }
+
     setMix(on) {
       this.mix = !!on;
       this.onStatus({ phase: on ? 'mix_on' : 'mix_off' });
