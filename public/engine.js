@@ -105,6 +105,8 @@
     };
   }
 
+  function nextInOrder(library, current) { return P ? P.nextInOrder(library, current) : null; }
+
   function keyDistance(a, b) { return P ? P.keyDistance(a, b) : 3; }
 
   function scoreCandidate(current, next) { return P ? P.scorePair(current, next) : -999; }
