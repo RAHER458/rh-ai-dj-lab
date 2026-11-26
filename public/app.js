@@ -118,7 +118,9 @@
     if (deckInfo) {
       const a = engine.track && engine.analysis.get(engine.track.id);
       const b = info && info.next && engine.analysis.get(info.next.id);
-      deckInfo.textContent = a ? `A ${Math.round(a.bpm)} BPM · B ${b ? Math.round(b.bpm) : '…'} BPM · ${info ? info.strategy : 'анализ'}` : 'анализ структуры…';
+      deckInfo.textContent = a && info
+        ? `A ${Math.round(a.bpm)} → B ${b ? Math.round(b.bpm) : '…'} BPM · ${info.strategy || 'analysis'} · OUT ${fmt(info.at)} · IN ${fmt(info.entryAt)} · ${Math.round(info.durationSec || 0)}s`
+        : 'анализ структуры…';
     }
     const marker = $('mixMarker');
     if (info && d) {

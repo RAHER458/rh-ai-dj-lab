@@ -3,6 +3,7 @@
   'use strict';
   const API = window.RH_DJ_API || 'https://rh-ai-dj-lab-api.rh-launcher.workers.dev';
   const CAMELOT = ['8B','3B','10B','5B','12B','7B','2B','9B','4B','11B','6B','1B'];
+  const P = window.RH_DJ_PLANNER;
   const ANALYSIS_CACHE = 'rh_dj_analysis_v2';
   const readCache = () => { try { return JSON.parse(localStorage.getItem(ANALYSIS_CACHE) || '{}') || {}; } catch { return {}; } };
   const writeCache = (cache) => { try { localStorage.setItem(ANALYSIS_CACHE, JSON.stringify(cache)); } catch { /* quota */ } };
@@ -104,76 +105,21 @@
     };
   }
 
-  function keyDistance(a, b) {
-    if (!a || !b) return 3;
-    const pa = a.match(/^(\d+)([AB])$/); const pb = b.match(/^(\d+)([AB])$/);
-    if (!pa || !pb) return 3;
-    const diff = Math.abs(Number(pa[1]) - Number(pb[1]));
-    return Math.min(diff, 12 - diff) + (pa[2] === pb[2] ? 0 : 1);
-  }
+  function keyDistance(a, b) { return P ? P.keyDistance(a, b) : 3; }
 
-  function scoreCandidate(current, next) {
-    if (!current || !next) return -999;
-    const bpmDelta = Math.abs((next.bpm || 0) - (current.bpm || 0)) / Math.max(1, current.bpm || 1);
-    const harmonic = keyDistance(current.key, next.key);
-    const energyDelta = Math.abs((next.energy || 0) - (current.energy || 0));
-    const vocal = Math.min(current.vocalRisk || 0, next.vocalRisk || 0);
-    return 5 - bpmDelta * 30 - harmonic * 0.9 - energyDelta * 2 - vocal;
-  }
+  function scoreCandidate(current, next) { return P ? P.scorePair(current, next) : -999; }
 
   function planTransition(a, b) {
-    if (!a || !b) return null;
-    const beatA = 60 / Math.max(60, a.bpm || 120);
-    const phraseA = beatA * 16; // phrase estimate: 4 bars, not a hard-coded transition duration
-    const base = scoreCandidate(a, b);
-    const exits = [];
-    // Only use analyzed section boundaries and grid-aligned phrase candidates.
-    for (const section of (a.sections || [])) {
-      if (section.start > a.duration * 0.30 && section.start < a.duration - 8) exits.push(section.start);
-      if (section.end > a.duration * 0.30 && section.end < a.duration - 8) exits.push(section.end);
-    }
-    for (let t = a.duration * 0.30; t < a.duration - 8; t += phraseA) exits.push(t);
-    const entries = [];
-    for (const section of (b.sections || [])) {
-      if (section.start < b.duration - 8 && section.start > 4) entries.push(section.start);
-    }
-    if (b.introEnd > 4 && b.introEnd < b.duration - 8) entries.push(b.introEnd);
-    if (!entries.length) entries.push(0);
-    const unique = (arr) => [...new Set(arr.map(v => Math.round(v * 10) / 10))];
-    let best = null;
-    for (const exitRaw of unique(exits)) for (const entryRaw of unique(entries)) {
-      const exitAt = Math.max(0, Math.round(exitRaw / (beatA * 4)) * beatA * 4);
-      const entryAt = Math.max(0, Math.round(entryRaw / (60 / Math.max(60,b.bpm||120) * 4)) * (60 / Math.max(60,b.bpm||120) * 4));
-      if (exitAt < a.duration * 0.25 || exitAt > a.duration - 10 || entryAt >= b.duration - 10) continue;
-      // Select blend length by tempo confidence, energy and phrase overlap risk.
-      const bpmDiff = Math.abs((b.bpm || 0) - (a.bpm || 0)) / Math.max(1, a.bpm || 1);
-      const vocalRisk = Math.max(a.vocalRisk || 0, b.vocalRisk || 0);
-      let bars = bpmDiff < 0.045 && vocalRisk < 0.48 ? 16 : bpmDiff < 0.09 ? 8 : 4;
-      let durationSec = bars * 4 * beatA;
-      if (exitAt + durationSec > a.duration - 0.5) {
-        bars = 4; durationSec = bars * 4 * beatA;
-      }
-      if (exitAt + durationSec > a.duration - 0.2) continue;
-      const sectionA = (a.sections || []).find(s => exitAt >= s.start - 1 && exitAt <= s.end + 1);
-      const sectionB = (b.sections || []).find(s => entryAt >= s.start - 1 && entryAt <= s.end + 1);
-      const eA = sectionA?.energy ?? a.energy ?? 0.5;
-      const eB = sectionB?.energy ?? b.energy ?? 0.5;
-      const latePenalty = Math.max(0, exitAt - (a.duration - 45)) / 12;
-      const entryStructureBonus = sectionB && ['drop','verse'].includes(sectionB.kind) ? 0.35 : 0;
-      const score = base + 1.8 * eA + 1.3 * eB - Math.abs(eA-eB)*1.8 - latePenalty + entryStructureBonus;
-      const strategy = bpmDiff > 0.12 ? 'tempo-safe blend'
-        : vocalRisk > 0.65 ? 'vocal-aware blend'
-          : keyDistance(a.key,b.key) <= 1 ? 'harmonic phrase blend' : 'phrase blend';
-      if (!best || score > best.score) best = { exitAt, entryAt, durationSec, bars, strategy, score, next: b };
-    }
-    return best || { exitAt: Math.max(a.duration*0.6,a.duration-20), entryAt: b.introEnd || 0, durationSec: 12, bars: 4, strategy:'fallback', score:base, next:b };
-  }
-
-  function nextInOrder(library, current) {
-    if (!library.length) return null;
-    const index = library.findIndex((t) => t.id === current.id);
-    if (index < 0) return library[0];
-    return library[(index + 1) % library.length];
+    if (!P || !P.plan) return null;
+    const plan = P.plan(a, b);
+    if (!plan) return null;
+    return {
+      ...plan,
+      exitAt: plan.transitionStartA,
+      entryAt: plan.transitionStartB,
+      durationSec: plan.transitionDuration,
+      next: b,
+    };
   }
 
   class Deck {
@@ -421,32 +367,21 @@
           }
         };
         const curve = applyCurve;
-        const N=129, fadeIn=[], fadeOut=[];
-        for(let i=0;i<N;i++){
-          const x=i/(N-1);
-          fadeIn.push(Math.sin(x*Math.PI/2));
-          fadeOut.push(Math.cos(x*Math.PI/2));
-        }
-        // Equal-power blend curves (not a linear volume fade).
-        curve(nextDeck.gain.gain,fadeIn,start,duration);
-        curve(oldDeck.gain.gain,fadeOut,start,duration);
+        const auto = plan.automation || {};
+        const N = 129, fadeIn = auto.incomingVolume || [], fadeOut = auto.outgoingVolume || [];
+        // Equal-power curves come from the planner when available.
+        curve(nextDeck.gain.gain, fadeIn.length ? fadeIn : Array.from({length:N},(_,i)=>Math.sin((i/(N-1))*Math.PI/2)), start, duration);
+        curve(oldDeck.gain.gain, fadeOut.length ? fadeOut : Array.from({length:N},(_,i)=>Math.cos((i/(N-1))*Math.PI/2)), start, duration);
 
         const ramp = applyCurve;
-        // Independent frequency-space choreography: new deck opens highs/mids first;
-        // low end is deliberately exchanged in the middle of the phrase.
-        const lowIn=[], lowOut=[], midIn=[], midOut=[], highIn=[], highOut=[];
-        for(let i=0;i<N;i++){
-          const x=i/(N-1);
-          const smooth=x*x*(3-2*x);
-          const swap=clamp((x-0.42)/0.18,0,1);
-          const s=swap*swap*(3-2*swap);
-          lowIn.push(-18+18*s);
-          lowOut.push(-2-22*s);
-          midIn.push(-8+8*smooth);
-          midOut.push(0-8*smooth);
-          highIn.push(-5+5*smooth);
-          highOut.push(0-5*smooth);
-        }
+        // EQ curves are planned in planner.js, not improvised in the executor.
+        const lowIn = (auto.lowEQ && auto.lowEQ.in) || [];
+        const lowOut = (auto.lowEQ && auto.lowEQ.out) || [];
+        const midIn = (auto.midEQ && auto.midEQ.in) || [];
+        const midOut = (auto.midEQ && auto.midEQ.out) || [];
+        const highIn = (auto.highEQ && auto.highEQ.in) || [];
+        const highOut = (auto.highEQ && auto.highEQ.out) || [];
+        if (!lowIn.length || !lowOut.length) throw new Error('planner_automation_missing');
         ramp(nextDeck.low.gain,lowIn,start,duration);
         ramp(oldDeck.low.gain,lowOut,start,duration);
         ramp(nextDeck.mid.gain,midIn,start,duration);
@@ -455,19 +390,19 @@
         ramp(oldDeck.high.gain,highOut,start,duration);
 
         // For high vocal-risk pairs, attenuate the mid band more deeply on the outgoing deck.
-        if((currentAnalysis.vocalRisk||0)+(nextAnalysis.vocalRisk||0)>1.25){
+        // Vocal ducking is included in the planner's mid curve; executor only
+        // adds it when the planner had to use a generic curve.
+        if (!auto.midEQ && (currentAnalysis.vocalRisk||0)+(nextAnalysis.vocalRisk||0)>1.25) {
           const duck=[]; for(let i=0;i<N;i++){const x=i/(N-1); duck.push(-10*Math.sin(x*Math.PI/2));}
           ramp(oldDeck.mid.gain,duck,start,duration);
         }
-        // Tempo-safe fallback gets a real filter transition; compatible pairs
-        // stay open so the two full-range signals can interact.
-        if (plan.strategy === 'tempo-safe blend') {
-          nextDeck.setFilter('highpass', 260, 0.04);
-          oldDeck.setFilter('lowpass', 18000, 0.04);
-          nextDeck.filter.frequency.setValueAtTime(260, start);
-          nextDeck.filter.frequency.linearRampToValueAtTime(35, end);
-          oldDeck.filter.frequency.setValueAtTime(18000, start);
-          oldDeck.filter.frequency.linearRampToValueAtTime(1200, end);
+        if (auto.filters) {
+          nextDeck.setFilter(auto.filters.incoming.type, auto.filters.incoming.from, 0.04);
+          oldDeck.setFilter(auto.filters.outgoing.type, auto.filters.outgoing.from, 0.04);
+          nextDeck.filter.frequency.setValueAtTime(auto.filters.incoming.from, start);
+          nextDeck.filter.frequency.linearRampToValueAtTime(auto.filters.incoming.to, end);
+          oldDeck.filter.frequency.setValueAtTime(auto.filters.outgoing.from, start);
+          oldDeck.filter.frequency.linearRampToValueAtTime(auto.filters.outgoing.to, end);
         } else {
           nextDeck.setFilter('allpass', 20000, 0.04);
           oldDeck.setFilter('allpass', 20000, 0.04);
